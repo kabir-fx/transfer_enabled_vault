@@ -41,11 +41,18 @@ pub struct TransferHook<'info> {
     pub whitelist: Account<'info, Whitelist>,
 
     #[account(
-        // Here each owner must be whitelisted in order to make a transfer
-        seeds = [b"whitelist", owner.key().as_ref()],
-        bump = whitelist_entry.bump,
+        // Verify source owner is whitelisted
+        seeds = [b"whitelist", source_token.owner.as_ref()],
+        bump,
     )]
-    pub whitelist_entry: Account<'info, WhitelistEntry>,
+    pub source_whitelist_entry: Account<'info, WhitelistEntry>,
+
+    #[account(
+        // Verify destination owner is whitelisted
+        seeds = [b"whitelist", destination_token.owner.as_ref()],
+        bump,
+    )]
+    pub destination_whitelist_entry: Account<'info, WhitelistEntry>,
 }
 
 impl<'info> TransferHook<'info> {
@@ -58,7 +65,9 @@ impl<'info> TransferHook<'info> {
         msg!("Source token owner: {}", self.source_token.owner);
         msg!("Destination token owner: {}", self.destination_token.owner);
 
-        msg!("Transfer allowed: The address is whitelisted");
+        // Since we have `source_whitelist_entry` and `destination_whitelist_entry` in the accounts struct with the correct seeds constraints, Anchor will automatically verify that they exist and are correct PDA accounts.
+        // If either is missing or incorrect, the transaction will fail before reaching here.
+        msg!("Transfer allowed: Both sender and receiver are whitelisted");
 
         Ok(())
     }

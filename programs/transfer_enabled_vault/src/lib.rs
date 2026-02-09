@@ -32,6 +32,10 @@ pub mod whitelist_transfer_hook {
         ctx.accounts.remove_from_whitelist(user)
     }
 
+    pub fn create_mint(ctx: Context<CreateMint>) -> Result<()> {
+        ctx.accounts.create_mint()
+    }
+
     pub fn initialize_transfer_hook(ctx: Context<InitializeExtraAccountMetaList>) -> Result<()> {
         msg!("Initializing Transfer Hook...");
 

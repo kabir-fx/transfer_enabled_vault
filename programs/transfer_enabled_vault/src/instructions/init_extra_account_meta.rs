@@ -29,7 +29,7 @@ impl<'info> InitializeExtraAccountMetaList<'info> {
         // Derive the whitelist PDA using our program ID
         let (whitelist_pda, _bump) = Pubkey::find_program_address(&[b"whitelist"], &ID);
 
-        let whitelist_entry_seeds = &[
+        let source_whitelist_entry_seeds = &[
             spl_tlv_account_resolution::seeds::Seed::Literal {
                 bytes: b"whitelist".to_vec(),
             },
@@ -37,10 +37,24 @@ impl<'info> InitializeExtraAccountMetaList<'info> {
             spl_tlv_account_resolution::seeds::Seed::AccountKey { index: 3 },
         ];
 
+        let destination_whitelist_entry_seeds = &[
+            spl_tlv_account_resolution::seeds::Seed::Literal {
+                bytes: b"whitelist".to_vec(),
+            },
+            // Take the Owner Public Key from the Destination Token Account (Index 2).
+            // Token Account Owner is at offset 32.
+            spl_tlv_account_resolution::seeds::Seed::AccountData {
+                account_index: 2,
+                data_index: 32,
+                length: 32,
+            },
+        ];
+
         Ok(vec![
             ExtraAccountMeta::new_with_pubkey(&whitelist_pda.to_bytes().into(), false, false)
                 .unwrap(),
-            ExtraAccountMeta::new_with_seeds(whitelist_entry_seeds, false, false)
+            ExtraAccountMeta::new_with_seeds(source_whitelist_entry_seeds, false, false).unwrap(),
+            ExtraAccountMeta::new_with_seeds(destination_whitelist_entry_seeds, false, false)
                 .unwrap(),
         ])
     }
