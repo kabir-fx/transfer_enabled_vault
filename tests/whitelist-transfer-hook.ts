@@ -3,39 +3,126 @@ import { Program } from "@coral-xyz/anchor";
 import {
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
-  createInitializeMintInstruction,
-  getMintLen,
-  ExtensionType,
-  createTransferCheckedWithTransferHookInstruction,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  createInitializeTransferHookInstruction,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
   createTransferCheckedInstruction,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import {
-  SendTransactionError,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
+  Keypair,
+  PublicKey,
+  Connection,
 } from "@solana/web3.js";
+import { LiteSVM } from "litesvm";
 import { WhitelistTransferHook } from "../target/types/whitelist_transfer_hook";
+import path from "path";
 
 describe("whitelist-transfer-hook", () => {
-  // Configure the client to use the local cluster.
-  const provider = anchor.AnchorProvider.env();
-  anchor.setProvider(provider);
+  // ---- LiteSVM setup ----
+  let svm: LiteSVM;
 
-  const wallet = provider.wallet as anchor.Wallet;
+  // Keypairs
+  const wallet = Keypair.generate();
+  const mint2022 = Keypair.generate();
+  const recipient = Keypair.generate();
 
-  const program = anchor.workspace
-    .whitelistTransferHook as Program<WhitelistTransferHook>;
+  // Program ID from Anchor.toml / IDL
+  const programId = new PublicKey(
+    "H7N63tnhQaS6VJb3bAoqGwycD55cNV5Nn8qpNG4EPESd",
+  );
 
-  const mint2022 = anchor.web3.Keypair.generate();
+  // Anchor program instance (used only to build instructions)
+  let program: Program<WhitelistTransferHook>;
 
-  // Vault must be an ATA derived from the mint and admin (wallet)
-  // This is derived AFTER mint creation, but declared here as a function
-  // to compute it when needed (since mint2022 pubkey is known at declaration time)
+  // Derived addresses (computed after setup)
+  let sourceTokenAccount: PublicKey;
+  let destinationTokenAccount: PublicKey;
+  let extraAccountMetaListPDA: PublicKey;
+  let whitelist: PublicKey;
+  let whitelistEntry: PublicKey;
+
+  // Helper: build, sign and send a transaction through LiteSVM
+  function sendTx(
+    instructions: anchor.web3.TransactionInstruction[],
+    signers: Keypair[],
+  ) {
+    const tx = new Transaction().add(...instructions);
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = wallet.publicKey;
+    for (const s of signers) {
+      tx.partialSign(s);
+    }
+    const res = svm.sendTransaction(tx);
+    return res;
+  }
+
+  before(() => {
+    // 1. Boot LiteSVM
+    svm = new LiteSVM();
+
+    // 2. Load the compiled program
+    const soPath = path.join(
+      __dirname,
+      "..",
+      "target",
+      "deploy",
+      "transfer_enabled_vault.so",
+    );
+    svm.addProgramFromFile(programId, soPath);
+
+    // 3. Fund the wallet and recipient
+    svm.airdrop(wallet.publicKey, BigInt(100_000_000_000)); // 100 SOL
+    svm.airdrop(recipient.publicKey, BigInt(1_000_000_000)); // 1 SOL
+
+    // 4. Build a dummy Anchor provider so we can use program.methods.xxx().instruction()
+    const dummyConnection = new Connection("http://localhost:8899"); // not actually used
+    const dummyWallet = new anchor.Wallet(wallet);
+    const dummyProvider = new anchor.AnchorProvider(
+      dummyConnection,
+      dummyWallet,
+      { commitment: "confirmed" },
+    );
+
+    // Load IDL and create Program instance
+    const idl = require("../target/idl/whitelist_transfer_hook.json");
+    program = new Program<WhitelistTransferHook>(idl, dummyProvider);
+
+    // 5. Pre-derive addresses
+    sourceTokenAccount = getAssociatedTokenAddressSync(
+      mint2022.publicKey,
+      wallet.publicKey,
+      false,
+      TOKEN_2022_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID,
+    );
+
+    destinationTokenAccount = getAssociatedTokenAddressSync(
+      mint2022.publicKey,
+      recipient.publicKey,
+      false,
+      TOKEN_2022_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID,
+    );
+
+    [extraAccountMetaListPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), mint2022.publicKey.toBuffer()],
+      programId,
+    );
+
+    whitelist = PublicKey.findProgramAddressSync(
+      [Buffer.from("whitelist")],
+      programId,
+    )[0];
+
+    whitelistEntry = PublicKey.findProgramAddressSync(
+      [Buffer.from("whitelist"), wallet.publicKey.toBytes()],
+      programId,
+    )[0];
+  });
+
+  // Helper: get vault (ATA of mint for wallet via Token-2022)
   const getVaultAddress = () =>
     getAssociatedTokenAddressSync(
       mint2022.publicKey,
@@ -45,45 +132,8 @@ describe("whitelist-transfer-hook", () => {
       ASSOCIATED_TOKEN_PROGRAM_ID,
     );
 
-  // Sender token account address
-  const sourceTokenAccount = getAssociatedTokenAddressSync(
-    mint2022.publicKey,
-    wallet.publicKey,
-    false,
-    TOKEN_2022_PROGRAM_ID,
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-  );
-
-  // Recipient token account address
-  const recipient = anchor.web3.Keypair.generate();
-  const destinationTokenAccount = getAssociatedTokenAddressSync(
-    mint2022.publicKey,
-    recipient.publicKey,
-    false,
-    TOKEN_2022_PROGRAM_ID,
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-  );
-
-  // ExtraAccountMetaList address
-  // Store extra accounts required by the custom transfer hook instruction
-  const [extraAccountMetaListPDA] =
-    anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("extra-account-metas"), mint2022.publicKey.toBuffer()],
-      program.programId,
-    );
-
-  const whitelist = anchor.web3.PublicKey.findProgramAddressSync(
-    [Buffer.from("whitelist")],
-    program.programId,
-  )[0];
-
-  const whitelistEntry = anchor.web3.PublicKey.findProgramAddressSync(
-    [Buffer.from("whitelist"), provider.publicKey.toBytes()],
-    program.programId,
-  )[0];
-
   it("Create Mint Account with Transfer Hook Extension", async () => {
-    const txSig = await program.methods
+    const ix = await program.methods
       .createMint()
       .accountsPartial({
         payer: wallet.publicKey,
@@ -92,88 +142,74 @@ describe("whitelist-transfer-hook", () => {
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_2022_PROGRAM_ID,
       })
-      .signers([mint2022])
-      .rpc();
+      .instruction();
 
-    const txDetails = await program.provider.connection.getTransaction(txSig, {
-      maxSupportedTransactionVersion: 0,
-      commitment: "confirmed",
-    });
-    //console.log(txDetails.meta.logMessages);
-
-    console.log("\nTransaction Signature: ", txSig);
+    const res = sendTx([ix], [wallet, mint2022]);
+    console.log("\nCreate Mint tx sent via LiteSVM");
   });
 
   it("Initializes the Whitelist", async () => {
-    const tx = await program.methods
+    const ix = await program.methods
       .initializeWhitelist()
       .accountsPartial({
-        admin: provider.publicKey,
+        admin: wallet.publicKey,
         whitelist,
         tokenMint: mint2022.publicKey,
         vault: getVaultAddress(),
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         tokenProgram: TOKEN_2022_PROGRAM_ID,
-        systemProgram: anchor.web3.SystemProgram.programId,
+        systemProgram: SystemProgram.programId,
       })
-      .rpc();
+      .instruction();
 
+    const res = sendTx([ix], [wallet]);
     console.log("\nWhitelist initialized:", whitelist.toBase58());
-    console.log("Transaction signature:", tx);
   });
 
   it("Add user to whitelist", async () => {
-    const tx = await program.methods
-      .addToWhitelist(provider.publicKey)
+    const ix = await program.methods
+      .addToWhitelist(wallet.publicKey)
       .accountsPartial({
-        admin: provider.publicKey,
+        admin: wallet.publicKey,
         whitelist,
         whitelistEntry,
       })
-      .rpc();
+      .instruction();
 
-    console.log("\nUser added to whitelist:", provider.publicKey.toBase58());
-    console.log("Transaction signature:", tx);
+    const res = sendTx([ix], [wallet]);
+    console.log("\nUser added to whitelist:", wallet.publicKey.toBase58());
   });
 
   it("Create Token Accounts and Mint Tokens", async () => {
     // 100 tokens
     const amount = 100 * 10 ** 9;
 
-    // NOTE: sourceTokenAccount is the same as vault (both derived from mint + wallet)
-    // The vault was already created in initializeWhitelist, so we only create destination
-    const transaction = new Transaction().add(
-      createAssociatedTokenAccountInstruction(
-        wallet.publicKey,
-        destinationTokenAccount,
-        recipient.publicKey,
-        mint2022.publicKey,
-        TOKEN_2022_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID,
-      ),
-      createMintToInstruction(
-        mint2022.publicKey,
-        sourceTokenAccount,
-        wallet.publicKey,
-        amount,
-        [],
-        TOKEN_2022_PROGRAM_ID,
-      ),
+    // sourceTokenAccount (vault) was already created in initializeWhitelist,
+    // so we only create the destination ATA and mint tokens.
+    const createDestAtaIx = createAssociatedTokenAccountInstruction(
+      wallet.publicKey,
+      destinationTokenAccount,
+      recipient.publicKey,
+      mint2022.publicKey,
+      TOKEN_2022_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID,
     );
 
-    const txSig = await sendAndConfirmTransaction(
-      provider.connection,
-      transaction,
-      [wallet.payer],
-      { skipPreflight: true },
+    const mintToIx = createMintToInstruction(
+      mint2022.publicKey,
+      sourceTokenAccount,
+      wallet.publicKey,
+      amount,
+      [],
+      TOKEN_2022_PROGRAM_ID,
     );
 
-    console.log("\nTransaction Signature: ", txSig);
+    const res = sendTx([createDestAtaIx, mintToIx], [wallet]);
+    console.log("\nToken accounts created and tokens minted");
   });
 
-  // Account to store extra accounts required by the transfer hook instruction
   it("Create ExtraAccountMetaList Account", async () => {
-    const initializeExtraAccountMetaListInstruction = await program.methods
+    const ix = await program.methods
       .initializeTransferHook()
       .accountsPartial({
         payer: wallet.publicKey,
@@ -181,46 +217,43 @@ describe("whitelist-transfer-hook", () => {
         extraAccountMetaList: extraAccountMetaListPDA,
         systemProgram: SystemProgram.programId,
       })
-      //.instruction();
-      .rpc();
+      .instruction();
 
-    //const transaction = new Transaction().add(initializeExtraAccountMetaListInstruction);
-
-    //const txSig = await sendAndConfirmTransaction(provider.connection, transaction, [wallet.payer], { skipPreflight: true, commitment: 'confirmed' });
+    const res = sendTx([ix], [wallet]);
     console.log(
       "\nExtraAccountMetaList Account created:",
       extraAccountMetaListPDA.toBase58(),
     );
-    console.log(
-      "Transaction Signature:",
-      initializeExtraAccountMetaListInstruction,
-    );
   });
 
   it("Transfer Hook with Extra Account Meta", async () => {
-    // Derive whitelist entries first
-    const [destWhitelistEntry] = anchor.web3.PublicKey.findProgramAddressSync(
+    // Derive whitelist entries
+    const [destWhitelistEntry] = PublicKey.findProgramAddressSync(
       [Buffer.from("whitelist"), recipient.publicKey.toBytes()],
-      program.programId,
+      programId,
     );
 
-    // 1. Whitelist the recipient so their whitelist entry exists
-    await program.methods
+    // 1. Whitelist the recipient
+    const whitelistIx = await program.methods
       .addToWhitelist(recipient.publicKey)
       .accounts({
-        admin: provider.publicKey,
+        admin: wallet.publicKey,
         whitelist,
         whitelistEntry: destWhitelistEntry,
-        systemProgram: anchor.web3.SystemProgram.programId,
+        systemProgram: SystemProgram.programId,
       })
-      .rpc();
+      .instruction();
 
+    sendTx([whitelistIx], [wallet]);
     console.log("Recipient whitelisted:", recipient.publicKey.toBase58());
 
+    // Need a fresh blockhash for the next transaction
+    svm.expireBlockhash();
+
+    // 2. Build the transfer instruction with extra accounts for the hook
     const amount = 1 * 10 ** 9;
     const amountBigInt = BigInt(amount);
 
-    // 2. Create the base transfer instruction
     const transferInstruction = createTransferCheckedInstruction(
       sourceTokenAccount,
       mint2022.publicKey,
@@ -232,58 +265,38 @@ describe("whitelist-transfer-hook", () => {
       TOKEN_2022_PROGRAM_ID,
     );
 
-    // 3. Manually add extra accounts required by the hook
-    // Order: [extraMeta, whitelist, sourceEntry, destEntry, programId]
-
-    // Derive whitelist entries
-    const [sourceWhitelistEntry] = anchor.web3.PublicKey.findProgramAddressSync(
+    // Derive source whitelist entry
+    const [sourceWhitelistEntry] = PublicKey.findProgramAddressSync(
       [Buffer.from("whitelist"), wallet.publicKey.toBytes()],
-      program.programId,
+      programId,
     );
 
-    // Append accounts to the instruction
+    // Append extra accounts required by the hook
     transferInstruction.keys.push(
-      // ExtraAccountMetaList PDA
       { pubkey: extraAccountMetaListPDA, isSigner: false, isWritable: false },
-      // Whitelist PDA (Account 5 in TransferHook context? No, strictly following ExtraAccountMetaList definition)
       { pubkey: whitelist, isSigner: false, isWritable: false },
-      // Source Whitelist Entry
       { pubkey: sourceWhitelistEntry, isSigner: false, isWritable: false },
-      // Destination Whitelist Entry
       { pubkey: destWhitelistEntry, isSigner: false, isWritable: false },
-      // Transfer hook program (Account Executing the hook)
-      { pubkey: program.programId, isSigner: false, isWritable: false },
+      { pubkey: programId, isSigner: false, isWritable: false },
     );
 
-    const transaction = new Transaction().add(transferInstruction);
-
-    try {
-      const txSig = await sendAndConfirmTransaction(
-        provider.connection,
-        transaction,
-        [wallet.payer],
-        { skipPreflight: true, commitment: "finalized" },
-      );
-      console.log("Transfer Signature:", txSig);
-    } catch (error) {
-      console.error("Transfer failed", error);
-      throw error;
-    }
+    const res = sendTx([transferInstruction], [wallet]);
+    console.log("Transfer completed via LiteSVM");
   });
 
   it("Remove user from whitelist (cleanup)", async () => {
-    const tx = await program.methods
-      .removeFromWhitelist(provider.publicKey)
+    // Expire blockhash so we get a fresh one
+    svm.expireBlockhash();
+
+    const ix = await program.methods
+      .removeFromWhitelist(wallet.publicKey)
       .accountsPartial({
-        admin: provider.publicKey,
+        admin: wallet.publicKey,
         whitelistEntry,
       })
-      .rpc();
+      .instruction();
 
-    console.log(
-      "\nUser removed from whitelist:",
-      provider.publicKey.toBase58(),
-    );
-    console.log("Transaction signature:", tx);
+    const res = sendTx([ix], [wallet]);
+    console.log("\nUser removed from whitelist:", wallet.publicKey.toBase58());
   });
 });
